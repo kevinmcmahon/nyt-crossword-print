@@ -11,8 +11,8 @@ echo ""
 
 # --- 1. Python dependencies ---
 echo "[1/4] Installing Python dependencies..."
-pip install --break-system-packages playwright 2>/dev/null || pip install playwright
-playwright install chromium
+uv pip install --system playwright
+uv run playwright install chromium
 echo "  ✅ Playwright + Chromium installed."
 echo ""
 
@@ -71,4 +71,4 @@ echo ""
 echo "=== Setup complete ==="
 echo ""
 echo "To test manually, run:"
-echo "  cd $SCRIPT_DIR && python3 fetch_and_print.py"
+echo "  cd $SCRIPT_DIR && uv run python3 fetch_and_print.py"
