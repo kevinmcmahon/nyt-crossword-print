@@ -19,7 +19,7 @@ the crossword on your printer.
 ## Prerequisites
 
 - **Ubuntu 20.04+** (your OpenClaw instance)
-- **Active NYT Games/Crossword subscription**
+- **Active NYT subscription that includes crossword access** (e.g., NYT Games or All Access — a basic News subscription alone does not include the crossword)
 - **HP LaserJet** (or any CUPS-compatible printer) on your Tailscale network
 - **OpenClaw** running with Telegram configured
 
