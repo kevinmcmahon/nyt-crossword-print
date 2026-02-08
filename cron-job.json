@@ -1,0 +1,20 @@
+{
+  "name": "NYT Crossword Print",
+  "schedule": {
+    "kind": "cron",
+    "expr": "10 21 * * *",
+    "tz": "America/Chicago"
+  },
+  "sessionTarget": "isolated",
+  "payload": {
+    "kind": "agentTurn",
+    "message": "Run the nyt-crossword-print skill: execute `python3 ~/.openclaw/skills/nyt-crossword-print/fetch_and_print.py` and report any errors to me. If it succeeds, no need to message me. If it fails, tell me what went wrong and suggest a fix.",
+    "deliver": true,
+    "channel": "telegram",
+    "bestEffortDeliver": true
+  },
+  "isolation": {
+    "postToMainPrefix": "🧩 Crossword",
+    "postToMainMode": "summary"
+  }
+}
