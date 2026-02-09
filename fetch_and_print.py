@@ -9,8 +9,6 @@ import json
 import subprocess
 import sys
 import time
-from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -19,6 +17,7 @@ from pathlib import Path
 SCRIPT_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = SCRIPT_DIR / "config.json"
 DOWNLOAD_DIR = SCRIPT_DIR / "downloads"
+COOKIE_PATH = SCRIPT_DIR / ".nyt_cookies.json"
 
 
 def load_config() -> dict:
@@ -46,128 +45,176 @@ def get_secret(key: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Cookie persistence
+# ---------------------------------------------------------------------------
+def _save_cookies(cookies: list[dict]):
+    """Save browser cookies to disk for reuse across runs."""
+    with open(COOKIE_PATH, "w") as f:
+        json.dump(cookies, f)
+
+
+def _load_cookies() -> list[dict] | None:
+    """Load previously saved cookies, or return None."""
+    if not COOKIE_PATH.exists():
+        return None
+    try:
+        with open(COOKIE_PATH) as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+# ---------------------------------------------------------------------------
 # NYT login + PDF download via Playwright
 # ---------------------------------------------------------------------------
-def download_crossword_pdf(email: str, password: str, target_date: datetime) -> Path:
+def _make_browser_context(p):
+    """Create a stealth-configured browser context."""
+    browser = p.chromium.launch(
+        headless=True,
+        args=["--disable-blink-features=AutomationControlled"],
+    )
+    context = browser.new_context(
+        viewport={"width": 1366, "height": 768},
+        user_agent=(
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+        ),
+        locale="en-US",
+        accept_downloads=True,
+    )
+    return browser, context
+
+
+def _nyt_login(page, email: str, password: str):
+    """Perform the NYT email/password login flow."""
+    print("[info] Navigating to NYT login page...")
+    page.goto(
+        "https://myaccount.nytimes.com/auth/enter-email"
+        "?response_type=cookie&client_id=lgcl"
+        "&redirect_uri=https://www.nytimes.com",
+        wait_until="networkidle",
+    )
+
+    print("[info] Entering email...")
+    email_input = page.wait_for_selector(
+        'input[name="email"], input[type="email"]', timeout=15000
+    )
+    email_input.fill(email)
+
+    submit_btn = page.query_selector(
+        'button[type="submit"], button:has-text("Continue")'
+    )
+    if submit_btn:
+        submit_btn.click()
+    else:
+        email_input.press("Enter")
+
+    print("[info] Entering password...")
+    password_input = page.wait_for_selector(
+        'input[name="password"], input[type="password"]', timeout=15000
+    )
+    password_input.fill(password)
+
+    login_btn = page.query_selector(
+        'button[type="submit"], button:has-text("Log In"), button:has-text("Sign In")'
+    )
+    if login_btn:
+        login_btn.click()
+    else:
+        password_input.press("Enter")
+
+    print("[info] Waiting for login to complete...")
+    page.wait_for_load_state("networkidle", timeout=30000)
+    time.sleep(2)
+
+
+def _download_pdf(page, pdf_url: str, pdf_path: Path) -> bool:
+    """Try to download the PDF. Returns True on success, False if auth expired."""
+    try:
+        with page.expect_download(timeout=30000) as download_info:
+            page.evaluate("url => { window.location.href = url; }", pdf_url)
+        download = download_info.value
+        download.save_as(str(pdf_path))
+        return True
+    except Exception:
+        # No download triggered — likely a 401/403 redirect to login
+        return False
+
+
+def _get_puzzle_id(page) -> tuple[int, str]:
+    """Fetch today's daily puzzle ID and publication date from the NYT API."""
+    resp = page.goto(
+        "https://www.nytimes.com/svc/crosswords/v6/puzzle/daily.json",
+        wait_until="load",
+        timeout=15000,
+    )
+    if resp.status != 200:
+        raise RuntimeError(f"Failed to fetch puzzle info (HTTP {resp.status})")
+    data = resp.json()
+    return data["id"], data.get("publicationDate", "unknown")
+
+
+def download_crossword_pdf(email: str, password: str, config: dict) -> Path:
     """
-    Launch headless Chromium, log into NYT, and download the crossword PDF.
-    Returns the path to the downloaded PDF file.
+    Download the crossword PDF, reusing saved cookies when possible.
+    Falls back to a full login if cookies are missing or expired.
     """
-    # Import here so the module can be loaded without playwright installed
-    # (e.g., for pause/resume commands).
     from playwright.sync_api import sync_playwright
+    from playwright_stealth import Stealth
 
     DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    block_opacity = config.get("block_opacity", 30)
 
-    # Date format for the PDF URL: e.g. "Feb0726" for Feb 07, 2026
-    date_str = target_date.strftime("%b%d%y")
-    pdf_url = f"https://www.nytimes.com/svc/crosswords/v2/puzzle/print/{date_str}.pdf"
-    pdf_path = DOWNLOAD_DIR / f"crossword_{date_str}.pdf"
+    saved_cookies = _load_cookies()
 
-    print(f"[info] Target date: {target_date.strftime('%Y-%m-%d')}")
-    print(f"[info] PDF URL: {pdf_url}")
+    with Stealth().use_sync(sync_playwright()) as p:
+        browser, context = _make_browser_context(p)
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        context = browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-            )
-        )
+        # Try saved cookies first (skip login entirely)
+        if saved_cookies:
+            print("[info] Trying saved cookies...")
+            context.add_cookies(saved_cookies)
+            page = context.new_page()
+
+            # Fetch puzzle ID from API
+            puzzle_id, pub_date = _get_puzzle_id(page)
+            pdf_url = f"https://www.nytimes.com/svc/crosswords/v2/puzzle/{puzzle_id}.pdf?block_opacity={block_opacity}"
+            pdf_path = DOWNLOAD_DIR / f"crossword_{puzzle_id}.pdf"
+            print(f"[info] Puzzle #{puzzle_id} ({pub_date})")
+            print(f"[info] PDF URL: {pdf_url}")
+
+            if _download_pdf(page, pdf_url, pdf_path):
+                print(f"[info] PDF saved to {pdf_path} ({pdf_path.stat().st_size} bytes)")
+                browser.close()
+                return pdf_path
+            print("[info] Saved cookies expired, logging in...")
+            page.close()
+            context.close()
+            browser.close()
+            browser, context = _make_browser_context(p)
+
+        # Full login flow
         page = context.new_page()
+        _nyt_login(page, email, password)
 
-        # ----- Step 1: Navigate to NYT login -----
-        print("[info] Navigating to NYT login page...")
-        page.goto(
-            "https://myaccount.nytimes.com/auth/enter-email"
-            "?response_type=cookie&client_id=lgcl"
-            "&redirect_uri=https://www.nytimes.com",
-            wait_until="networkidle",
-        )
+        # Save cookies for next time
+        _save_cookies(context.cookies())
 
-        # ----- Step 2: Enter email -----
-        print("[info] Entering email...")
-        email_input = page.wait_for_selector(
-            'input[name="email"], input[type="email"]', timeout=15000
-        )
-        email_input.fill(email)
+        # Fetch puzzle ID and download PDF
+        puzzle_id, pub_date = _get_puzzle_id(page)
+        pdf_url = f"https://www.nytimes.com/svc/crosswords/v2/puzzle/{puzzle_id}.pdf?block_opacity={block_opacity}"
+        pdf_path = DOWNLOAD_DIR / f"crossword_{puzzle_id}.pdf"
+        print(f"[info] Puzzle #{puzzle_id} ({pub_date})")
+        print(f"[info] Downloading: {pdf_url}")
 
-        # Click continue / submit
-        submit_btn = page.query_selector(
-            'button[type="submit"], button:has-text("Continue")'
-        )
-        if submit_btn:
-            submit_btn.click()
-        else:
-            email_input.press("Enter")
-
-        # ----- Step 3: Enter password -----
-        print("[info] Entering password...")
-        password_input = page.wait_for_selector(
-            'input[name="password"], input[type="password"]', timeout=15000
-        )
-        password_input.fill(password)
-
-        login_btn = page.query_selector(
-            'button[type="submit"], button:has-text("Log In"), button:has-text("Sign In")'
-        )
-        if login_btn:
-            login_btn.click()
-        else:
-            password_input.press("Enter")
-
-        # Wait for login to complete
-        print("[info] Waiting for login to complete...")
-        page.wait_for_load_state("networkidle", timeout=30000)
-
-        # Brief pause to ensure cookies are fully set
-        time.sleep(2)
-
-        # ----- Step 4: Download the PDF -----
-        print(f"[info] Downloading crossword PDF...")
-
-        # Use the page context (which has auth cookies) to download
-        response = page.goto(pdf_url, wait_until="load", timeout=30000)
-
-        if response is None:
-            browser.close()
-            raise RuntimeError(f"No response received for {pdf_url}")
-
-        if response.status == 403 or response.status == 401:
+        if not _download_pdf(page, pdf_url, pdf_path):
             browser.close()
             raise RuntimeError(
-                f"Authentication failed (HTTP {response.status}). "
-                "Login may have failed or subscription may not cover crosswords."
+                "Authentication failed. Login may have failed or "
+                "subscription may not cover crosswords."
             )
 
-        if response.status == 404:
-            browser.close()
-            raise RuntimeError(
-                f"Crossword PDF not found (HTTP 404). "
-                f"The puzzle for {date_str} may not be published yet."
-            )
-
-        if response.status != 200:
-            browser.close()
-            raise RuntimeError(
-                f"Unexpected HTTP status {response.status} when downloading PDF."
-            )
-
-        # Verify we actually got a PDF (not an HTML error page)
-        content_type = response.headers.get("content-type", "")
-        if "pdf" not in content_type.lower():
-            browser.close()
-            raise RuntimeError(
-                f"Expected a PDF but received content-type: {content_type}. "
-                "The download URL may have changed or login failed silently."
-            )
-
-        body = response.body()
-        pdf_path.write_bytes(body)
-        print(f"[info] PDF saved to {pdf_path} ({len(body)} bytes)")
-
-        browser.close()
+        print(f"[info] PDF saved to {pdf_path} ({pdf_path.stat().st_size} bytes)")
 
     return pdf_path
 
@@ -237,20 +284,6 @@ def main():
         print(f"[error] {e}", file=sys.stderr)
         sys.exit(1)
 
-    # Determine today's date in Central Time
-    # NYT publishes at 9 PM CT — if we're running after 9 PM CT,
-    # we want tomorrow's date (the puzzle that just dropped).
-    ct = ZoneInfo("America/Chicago")
-    now_ct = datetime.now(ct)
-
-    # The puzzle published at 9 PM CT is for the *next* calendar day.
-    # e.g., the puzzle published Mon 9 PM is Tuesday's puzzle.
-    # So if running at 9:10 PM Monday, we want Tuesday's date.
-    if now_ct.hour >= 21:
-        target_date = now_ct + timedelta(days=1)
-    else:
-        target_date = now_ct
-
     # Check printer is reachable
     try:
         status = check_printer_status(printer_name)
@@ -267,7 +300,7 @@ def main():
     for attempt in range(1, max_retries + 1):
         try:
             print(f"[info] Download attempt {attempt}/{max_retries}...")
-            pdf_path = download_crossword_pdf(nyt_email, nyt_password, target_date)
+            pdf_path = download_crossword_pdf(nyt_email, nyt_password, config)
             break
         except RuntimeError as e:
             print(f"[warn] Attempt {attempt} failed: {e}", file=sys.stderr)

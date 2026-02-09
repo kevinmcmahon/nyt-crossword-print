@@ -11,9 +11,29 @@ echo ""
 
 # --- 1. Python dependencies ---
 echo "[1/4] Installing Python dependencies..."
-uv pip install --system playwright
-uv run playwright install chromium
-echo "  ✅ Playwright + Chromium installed."
+if [ ! -d "$SCRIPT_DIR/.venv" ]; then
+    uv venv "$SCRIPT_DIR/.venv"
+    echo "  Created venv at $SCRIPT_DIR/.venv"
+else
+    echo "  Venv already exists, skipping creation."
+fi
+
+if ! "$SCRIPT_DIR/.venv/bin/python" -c "import playwright" 2>/dev/null; then
+    uv pip install --python "$SCRIPT_DIR/.venv/bin/python" playwright
+    echo "  Installed playwright."
+else
+    echo "  playwright already installed, skipping."
+fi
+
+CHROMIUM_DIR=$("$SCRIPT_DIR/.venv/bin/python" -m playwright install --dry-run chromium 2>/dev/null \
+    | grep -m1 'Install location:' | awk '{print $NF}')
+if [ -z "$CHROMIUM_DIR" ] || [ ! -d "$CHROMIUM_DIR" ]; then
+    "$SCRIPT_DIR/.venv/bin/python" -m playwright install chromium
+    echo "  Installed Chromium browser."
+else
+    echo "  Chromium already installed, skipping."
+fi
+echo "  ✅ Playwright + Chromium ready (venv: $SCRIPT_DIR/.venv)"
 echo ""
 
 # --- 2. Verify pass is available ---
@@ -71,4 +91,4 @@ echo ""
 echo "=== Setup complete ==="
 echo ""
 echo "To test manually, run:"
-echo "  cd $SCRIPT_DIR && uv run python3 fetch_and_print.py"
+echo "  cd $SCRIPT_DIR && .venv/bin/python fetch_and_print.py"

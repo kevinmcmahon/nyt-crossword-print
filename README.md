@@ -19,9 +19,29 @@ the crossword on your printer.
 ## Prerequisites
 
 - **Ubuntu 20.04+** (your OpenClaw instance)
+- **[uv](https://docs.astral.sh/uv/)** — Python package manager (`curl -LsSf https://astral.sh/uv/install.sh | sh`)
+- **[pass](https://www.passwordstore.org/)** — GNU password manager, initialized with a GPG key
+- **CUPS** — printing system
 - **Active NYT subscription that includes crossword access** (e.g., NYT Games or All Access — a basic News subscription alone does not include the crossword)
 - **HP LaserJet** (or any CUPS-compatible printer) on your Tailscale network
 - **OpenClaw** running with Telegram configured
+
+Install system dependencies:
+
+```bash
+sudo apt install -y pass cups
+
+# Playwright's headless Chromium needs these system libraries
+sudo apt install -y libatk1.0-0t64 libatk-bridge2.0-0t64 libatspi2.0-0t64 \
+  libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libgbm1 libasound2t64
+```
+
+Initialize `pass` (one-time, if not already done):
+
+```bash
+gpg --gen-key
+pass init <your-gpg-id>
+```
 
 ## Quick Setup
 
