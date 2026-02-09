@@ -14,6 +14,7 @@ tags:
 requirements:
   - python3 (3.10+)
   - playwright (pip install playwright && playwright install chromium)
+  - playwright-stealth (pip install playwright-stealth) — required for NYT bot detection
   - pass (GNU password store, for NYT credentials)
   - CUPS (for lp print command)
 ---
@@ -25,41 +26,61 @@ to your network printer automatically each evening after the puzzle is published
 
 ## Prerequisites
 
-1. **NYT Subscription**: You must have an active NYT Games/Crossword subscription.
+1. **NYT Subscription**: You must have an active NYT Games or All Access subscription
+   (a basic News subscription does not include crossword access).
 2. **`pass` (GNU Password Store)**: NYT credentials stored securely:
    - `pass insert nyt/email`
    - `pass insert nyt/password`
-3. **Playwright + Chromium**:
+3. **Playwright + Stealth + Chromium**:
    ```bash
-   pip install playwright
+   pip install playwright playwright-stealth
    playwright install chromium
    ```
+   `playwright-stealth` is required to bypass NYT's DataDome bot detection.
 4. **CUPS**: Configured with your target printer. Verify with `lpstat -p`.
 5. **Tailscale**: Printer accessible on the Tailscale network.
 
-## Configuration
+## What You Need to Configure
 
-Edit `config.json` to set your printer name and preferences:
+### 1. NYT Credentials
+
+```bash
+pass insert nyt/email      # your NYT account email
+pass insert nyt/password   # your NYT account password
+```
+
+### 2. Printer + Settings
+
+Edit `config.json` — at minimum, set `printer_name` to match your CUPS printer:
 
 ```json
 {
-  "printer_name": "HP_LaserJet",
+  "printer_name": "YOUR_PRINTER_NAME",
   "copies": 1,
   "fit_to_page": true,
+  "block_opacity": 30,
   "paused": false
 }
 ```
 
-Get your CUPS printer name by running `lpstat -p -d`.
+Find your CUPS printer name with `lpstat -p -d`.
+
+| Field           | Purpose                                          |
+| --------------- | ------------------------------------------------ |
+| `printer_name`  | CUPS printer name — **you must set this**        |
+| `copies`        | Number of copies to print                        |
+| `fit_to_page`   | Scale PDF to fit the page                        |
+| `block_opacity` | Black square darkness, 0 (white) to 100 (black)  |
+| `paused`        | `true` to skip nightly prints                    |
 
 ## Cron Setup
 
-Schedule the skill to run nightly at 9:10 PM Central:
+Schedule the skill to run nightly at 9:05 PM Central:
 
 ```bash
 openclaw cron add \
   --name "NYT Crossword Print" \
-  --cron "10 21 * * *" \
+  --cron "5 21 * * *" \
   --tz "America/Chicago" \
   --session isolated \
   --message "Run the nyt-crossword-print skill: download and print today's crossword." \
@@ -80,17 +101,27 @@ openclaw cron add \
 
 1. Checks the pause flag in `config.json` — skips if paused.
 2. Retrieves NYT credentials from `pass`.
-3. Launches headless Chromium via Playwright.
-4. Logs into the NYT account (email → password flow).
-5. Downloads the crossword PDF for today's date.
-6. Sends the PDF to the configured CUPS printer via `lp`.
-7. Reports success or failure. On failure, outputs an error message for
-   Telegram delivery.
+3. Launches headless Chromium via Playwright (with stealth mode).
+4. **Tries saved cookies first** — loads `.nyt_cookies.json` and attempts to
+   download the PDF without logging in. This is faster and avoids bot detection.
+5. **Falls back to full login** if cookies are missing or expired — performs the
+   email/password flow, then saves the new cookies for next time.
+6. Fetches today's puzzle ID from the NYT API and downloads the PDF.
+7. Sends the PDF to the configured CUPS printer via `lp`.
+8. Cleans up the downloaded PDF.
+
+Cookie state is stored in `.nyt_cookies.json` (gitignored). The key auth cookie
+is `NYT-S`. Sessions typically last several weeks before expiring.
 
 ## Troubleshooting
 
-- **Auth failures**: NYT may change their login flow. Check the login selectors
-  in `fetch_and_print.py` and update if needed.
+- **Auth failures**: Delete `.nyt_cookies.json` to force a fresh login.
+  If that doesn't help, verify credentials with `pass show nyt/email` and
+  `pass show nyt/password`. NYT may have changed their login flow — check
+  if you can log in manually.
+- **Bot detection / IP blocked**: The script uses `playwright-stealth` to avoid
+  DataDome. Do **not** make non-stealth requests to `myaccount.nytimes.com`
+  from the same IP — DataDome blocks aggressively (15+ minutes).
 - **Printer offline**: Ensure the printer is reachable via Tailscale
   (`ping <printer-tailscale-ip>`) and registered in CUPS (`lpstat -p`).
 - **PDF not available**: The puzzle publishes at 9 PM CT. The script retries
