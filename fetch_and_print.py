@@ -141,23 +141,26 @@ def _download_pdf(page, pdf_url: str, pdf_path: Path) -> bool:
         return False
 
 
-def _get_puzzle_id(page) -> tuple[int, str]:
-    """Fetch today's daily puzzle ID and publication date from the NYT API."""
-    resp = page.goto(
-        "https://www.nytimes.com/svc/crosswords/v6/puzzle/daily.json",
-        wait_until="load",
-        timeout=15000,
-    )
+def _get_puzzle_id(page, date: str | None = None) -> tuple[int, str]:
+    """Fetch puzzle ID and publication date from the NYT API.
+    If date is given (YYYY-MM-DD), fetch that date's puzzle; otherwise today's.
+    """
+    if date:
+        url = f"https://www.nytimes.com/svc/crosswords/v6/puzzle/daily/{date}.json"
+    else:
+        url = "https://www.nytimes.com/svc/crosswords/v6/puzzle/daily.json"
+    resp = page.goto(url, wait_until="load", timeout=15000)
     if resp.status != 200:
         raise RuntimeError(f"Failed to fetch puzzle info (HTTP {resp.status})")
     data = resp.json()
     return data["id"], data.get("publicationDate", "unknown")
 
 
-def download_crossword_pdf(email: str, password: str, config: dict) -> Path:
+def download_crossword_pdf(email: str, password: str, config: dict, date: str | None = None) -> Path:
     """
     Download the crossword PDF, reusing saved cookies when possible.
     Falls back to a full login if cookies are missing or expired.
+    If date is given (YYYY-MM-DD), fetch that date's puzzle; otherwise today's.
     """
     from playwright.sync_api import sync_playwright
     from playwright_stealth import Stealth
@@ -177,7 +180,7 @@ def download_crossword_pdf(email: str, password: str, config: dict) -> Path:
             page = context.new_page()
 
             # Fetch puzzle ID from API
-            puzzle_id, pub_date = _get_puzzle_id(page)
+            puzzle_id, pub_date = _get_puzzle_id(page, date)
             pdf_url = f"https://www.nytimes.com/svc/crosswords/v2/puzzle/{puzzle_id}.pdf?block_opacity={block_opacity}"
             pdf_path = DOWNLOAD_DIR / f"crossword_{puzzle_id}.pdf"
             print(f"[info] Puzzle #{puzzle_id} ({pub_date})")
@@ -257,6 +260,11 @@ def check_printer_status(printer_name: str) -> str:
 # Main
 # ---------------------------------------------------------------------------
 def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="Download and print an NYT crossword.")
+    parser.add_argument("--date", help="Puzzle date (YYYY-MM-DD). Defaults to today's puzzle.")
+    args = parser.parse_args()
+
     max_retries = 3
     retry_delay_seconds = 60
 
@@ -267,8 +275,8 @@ def main():
         print(f"[error] Failed to load config: {e}", file=sys.stderr)
         sys.exit(1)
 
-    # Check pause flag
-    if is_paused(config):
+    # Check pause flag (skip for ad-hoc date requests)
+    if not args.date and is_paused(config):
         print("[info] Crossword printing is PAUSED. Skipping.")
         sys.exit(0)
 
@@ -300,7 +308,7 @@ def main():
     for attempt in range(1, max_retries + 1):
         try:
             print(f"[info] Download attempt {attempt}/{max_retries}...")
-            pdf_path = download_crossword_pdf(nyt_email, nyt_password, config)
+            pdf_path = download_crossword_pdf(nyt_email, nyt_password, config, args.date)
             break
         except RuntimeError as e:
             print(f"[warn] Attempt {attempt} failed: {e}", file=sys.stderr)

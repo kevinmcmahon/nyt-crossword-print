@@ -90,12 +90,19 @@ openclaw cron add \
 
 ## Telegram Commands
 
-- **Pause**: Tell the agent "pause crossword printing"
-  - The agent should run: `python3 pause_resume.py pause`
-- **Resume**: Tell the agent "resume crossword printing"
-  - The agent should run: `python3 pause_resume.py resume`
-- **Status**: Tell the agent "crossword printing status"
-  - The agent should run: `python3 pause_resume.py status`
+- **Print today's crossword**: "print the crossword"
+  - Run: `python3 fetch_and_print.py`
+- **Print a specific date**: "print the crossword for Feb 7, 2025"
+  - Run: `python3 fetch_and_print.py --date 2025-02-07`
+  - Convert whatever date format the user provides into `YYYY-MM-DD`
+- **Pause**: "pause crossword printing"
+  - Run: `python3 pause_resume.py pause`
+- **Resume**: "resume crossword printing"
+  - Run: `python3 pause_resume.py resume`
+- **Status**: "crossword printing status"
+  - Run: `python3 pause_resume.py status`
+
+All commands must be run from the skill directory: `cd /home/openclaw/projects/nyt-crossword-print && .venv/bin/python ...`
 
 ## How It Works
 
