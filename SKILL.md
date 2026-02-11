@@ -4,7 +4,7 @@ description: >
   Automatically downloads the daily NYT crossword puzzle PDF and prints it
   to a network printer. Runs on a nightly schedule via cron. Supports
   pause/resume via Telegram and sends error alerts on failure.
-version: 1.0.0
+version: 1.1.0
 author: user
 tags:
   - crossword
@@ -15,7 +15,7 @@ requirements:
   - python3 (3.10+)
   - playwright (pip install playwright && playwright install chromium)
   - playwright-stealth (pip install playwright-stealth) — required for NYT bot detection
-  - pass (GNU password store, for NYT credentials)
+  - pymupdf (pip install pymupdf) — for block opacity post-processing
   - CUPS (for lp print command)
 ---
 
@@ -28,26 +28,39 @@ to your network printer automatically each evening after the puzzle is published
 
 1. **NYT Subscription**: You must have an active NYT Games or All Access subscription
    (a basic News subscription does not include crossword access).
-2. **`pass` (GNU Password Store)**: NYT credentials stored securely:
-   - `pass insert nyt/email`
-   - `pass insert nyt/password`
+2. **NYT-S Cookie**: A valid `NYT-S` session cookie saved to `.nyt_cookies.json`.
+   See [Authentication](#authentication) below.
 3. **Playwright + Stealth + Chromium**:
    ```bash
    pip install playwright playwright-stealth
    playwright install chromium
    ```
-   `playwright-stealth` is required to bypass NYT's DataDome bot detection.
-4. **CUPS**: Configured with your target printer. Verify with `lpstat -p`.
-5. **Tailscale**: Printer accessible on the Tailscale network.
+4. **PyMuPDF** (for block opacity):
+   ```bash
+   pip install pymupdf
+   ```
+5. **CUPS**: Configured with your target printer. Verify with `lpstat -p`.
+6. **Tailscale**: Printer accessible on the Tailscale network.
 
 ## What You Need to Configure
 
-### 1. NYT Credentials
+### 1. NYT-S Cookie (required)
+
+The script authenticates using a saved `NYT-S` session cookie — there is no
+automated login (NYT's DataDome bot detection blocks it).
+
+To get your cookie: log into nytimes.com in a browser, open DevTools → Application
+→ Cookies → `NYT-S`, and copy the value. Then save it:
 
 ```bash
-pass insert nyt/email      # your NYT account email
-pass insert nyt/password   # your NYT account password
+cat > .nyt_cookies.json << 'EOF'
+[{"name":"NYT-S","value":"YOUR_COOKIE_HERE","domain":".nytimes.com","path":"/","secure":true,"httpOnly":true,"sameSite":"None"}]
+EOF
 ```
+
+Sessions typically last several weeks. When the cookie expires, the script will
+fail with a clear error message and you'll get a **Telegram notification** asking
+you to provide a fresh cookie.
 
 ### 2. Printer + Settings
 
@@ -107,28 +120,37 @@ All commands must be run from the skill directory: `cd /home/openclaw/projects/n
 ## How It Works
 
 1. Checks the pause flag in `config.json` — skips if paused.
-2. Retrieves NYT credentials from `pass`.
+2. Loads the saved `NYT-S` cookie from `.nyt_cookies.json`.
 3. Launches headless Chromium via Playwright (with stealth mode).
-4. **Tries saved cookies first** — loads `.nyt_cookies.json` and attempts to
-   download the PDF without logging in. This is faster and avoids bot detection.
-5. **Falls back to full login** if cookies are missing or expired — performs the
-   email/password flow, then saves the new cookies for next time.
-6. Fetches today's puzzle ID from the NYT API and downloads the PDF.
+4. Fetches today's puzzle ID from the NYT API.
+5. Downloads the PDF using cookie authentication.
+6. If `block_opacity` < 100, post-processes the PDF to lighten the black
+   grid squares (edits the PDF content stream directly — text stays black).
 7. Sends the PDF to the configured CUPS printer via `lp`.
 8. Cleans up the downloaded PDF.
 
-Cookie state is stored in `.nyt_cookies.json` (gitignored). The key auth cookie
-is `NYT-S`. Sessions typically last several weeks before expiring.
+If the cookie has expired, the script exits with an error. Because the cron
+job uses `--deliver --channel telegram`, you'll get a Telegram message telling
+you to provide a fresh cookie.
+
+## Authentication
+
+NYT uses DataDome bot detection which blocks automated login attempts.
+The script does **not** attempt to log in — it relies entirely on a saved
+`NYT-S` session cookie.
+
+Cookie state is stored in `.nyt_cookies.json` (gitignored). Sessions typically
+last several weeks before expiring. When it expires:
+
+1. You'll get a Telegram alert from the failed cron job.
+2. Log into nytimes.com in a browser.
+3. Copy the `NYT-S` cookie value from DevTools.
+4. Update `.nyt_cookies.json` (or tell the agent your new cookie value).
 
 ## Troubleshooting
 
-- **Auth failures**: Delete `.nyt_cookies.json` to force a fresh login.
-  If that doesn't help, verify credentials with `pass show nyt/email` and
-  `pass show nyt/password`. NYT may have changed their login flow — check
-  if you can log in manually.
-- **Bot detection / IP blocked**: The script uses `playwright-stealth` to avoid
-  DataDome. Do **not** make non-stealth requests to `myaccount.nytimes.com`
-  from the same IP — DataDome blocks aggressively (15+ minutes).
+- **Cookie expired**: You'll see "Cookie expired" in the error output.
+  Get a fresh `NYT-S` cookie from your browser and update `.nyt_cookies.json`.
 - **Printer offline**: Ensure the printer is reachable via Tailscale
   (`ping <printer-tailscale-ip>`) and registered in CUPS (`lpstat -p`).
 - **PDF not available**: The puzzle publishes at 9 PM CT. The script retries

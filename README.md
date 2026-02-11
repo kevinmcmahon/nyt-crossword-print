@@ -1,4 +1,4 @@
-# 🧩 NYT Crossword Print — OpenClaw Skill
+# NYT Crossword Print
 
 Automatically downloads and prints the daily New York Times crossword puzzle
 every evening. Designed to run as an OpenClaw skill with a nightly cron job.
@@ -8,19 +8,18 @@ every evening. Designed to run as an OpenClaw skill with a nightly cron job.
 Every night at **9:05 PM Central**, OpenClaw runs a Playwright-based script that:
 
 1. Checks if printing is paused (skips if so)
-2. Retrieves your NYT credentials from `pass`
-3. Logs into nytimes.com via headless Chromium
-4. Downloads the crossword PDF for today
+2. Loads your saved `NYT-S` session cookie
+3. Fetches the puzzle ID and downloads the PDF
+4. Lightens the black grid squares if `block_opacity` < 100 (saves toner)
 5. Sends it to your printer via CUPS
 
-On failure, you get a Telegram alert. On success, it's silent — you just find
-the crossword on your printer.
+On failure (including expired cookies), you get a Telegram alert. On success,
+it's silent — you just find the crossword on your printer.
 
 ## Prerequisites
 
 - **Ubuntu 20.04+** (your OpenClaw instance)
 - **[uv](https://docs.astral.sh/uv/)** — Python package manager (`curl -LsSf https://astral.sh/uv/install.sh | sh`)
-- **[pass](https://www.passwordstore.org/)** — GNU password manager, initialized with a GPG key
 - **CUPS** — printing system
 - **Active NYT subscription that includes crossword access** (e.g., NYT Games or All Access — a basic News subscription alone does not include the crossword)
 - **HP LaserJet** (or any CUPS-compatible printer) on your Tailscale network
@@ -29,34 +28,31 @@ the crossword on your printer.
 Install system dependencies:
 
 ```bash
-sudo apt install -y pass cups
+sudo apt install -y cups
 
 # Playwright's headless Chromium needs these system libraries
 sudo apt install -y libatk1.0-0t64 libatk-bridge2.0-0t64 libatspi2.0-0t64 \
   libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libgbm1 libasound2t64
 ```
 
-Initialize `pass` (one-time, if not already done):
-
-```bash
-gpg --gen-key
-pass init <your-gpg-id>
-```
-
 ## What You Need to Customize
 
-Before the skill will work, you need to configure these three things:
+### 1. NYT-S Cookie (required)
 
-### 1. NYT Credentials (required)
+The script authenticates using a saved `NYT-S` session cookie — there is no
+automated login (NYT's DataDome bot detection blocks it).
 
-Store your NYT email and password in `pass`:
+To get your cookie: log into nytimes.com in a browser, open DevTools → Application
+→ Cookies → `NYT-S`, and copy the value. Then save it:
 
 ```bash
-pass insert nyt/email      # enter your NYT account email
-pass insert nyt/password   # enter your NYT account password
+cat > .nyt_cookies.json << 'EOF'
+[{"name":"NYT-S","value":"YOUR_COOKIE_HERE","domain":".nytimes.com","path":"/","secure":true,"httpOnly":true,"sameSite":"None"}]
+EOF
 ```
 
-These are read at runtime by the script — nothing is stored in plaintext.
+Sessions typically last several weeks. When the cookie expires, you'll get a
+Telegram notification asking you to provide a fresh one.
 
 ### 2. Printer Name (required)
 
@@ -80,27 +76,6 @@ The default schedule is **9:05 PM Central** (5 minutes after the puzzle
 publishes). Edit `cron-job.json` or the `openclaw cron add` command to change
 the time or timezone.
 
-## How Authentication Works
-
-The script uses a two-tier approach to avoid logging in every run:
-
-1. **Saved cookies (fast path)** — On the first successful login, browser
-   cookies are saved to `.nyt_cookies.json` (gitignored, never committed).
-   On subsequent runs, the script loads these cookies and attempts to download
-   the PDF directly — no login page, no bot detection risk.
-
-2. **Full login (fallback)** — If the saved cookies are missing or expired
-   (NYT sessions typically last weeks), the script performs a full
-   Playwright-based login using your `pass` credentials, then saves the new
-   cookies for next time.
-
-The key auth cookie is **`NYT-S`** — this is what grants access to subscriber
-content. You never need to manage this manually; the script handles it.
-
-**Bot detection:** The script uses `playwright-stealth` to avoid DataDome
-bot detection on NYT. Do not make raw HTTP requests to `myaccount.nytimes.com`
-from the same IP — DataDome will block it aggressively (15+ minutes).
-
 ## Quick Setup
 
 ```bash
@@ -117,7 +92,7 @@ openclaw cron add \
   --cron "5 21 * * *" \
   --tz "America/Chicago" \
   --session isolated \
-  --message "Run the nyt-crossword-print skill: execute python3 ~/.openclaw/skills/nyt-crossword-print/fetch_and_print.py and report any errors to me." \
+  --message "Run the nyt-crossword-print skill: download and print today's crossword." \
   --deliver \
   --channel telegram
 
@@ -125,25 +100,18 @@ openclaw cron add \
 openclaw gateway restart
 ```
 
-## Credential Management
+## Authentication
 
-Credentials are stored with `pass` (GPG-encrypted at rest):
+NYT uses DataDome bot detection which blocks automated login attempts.
+The script does **not** attempt to log in — it relies entirely on a saved
+`NYT-S` session cookie.
 
-```bash
-# View stored email
-pass show nyt/email
+Cookie state is stored in `.nyt_cookies.json` (gitignored). When it expires:
 
-# Update credentials
-pass edit nyt/email
-pass edit nyt/password
-```
-
-Cookie state is stored in `.nyt_cookies.json` (gitignored). If you run into
-persistent auth issues, delete this file to force a fresh login:
-
-```bash
-rm .nyt_cookies.json
-```
+1. You'll get a Telegram alert from the failed cron job.
+2. Log into nytimes.com in a browser.
+3. Copy the `NYT-S` cookie value from DevTools.
+4. Update `.nyt_cookies.json` (or tell the agent your new cookie value).
 
 ## Telegram Commands
 
@@ -212,16 +180,10 @@ Downloaded PDFs are saved to `downloads/` temporarily and deleted after printing
 
 ## Troubleshooting
 
-**Auth failure**
-- Delete `.nyt_cookies.json` to force a fresh login: `rm .nyt_cookies.json`
-- Verify credentials: `pass show nyt/email` and `pass show nyt/password`
-- NYT may have changed their login flow — check if you can log in manually
-- Re-run setup: `pass edit nyt/password`
-
-**Bot detection / IP blocked**
-- The script uses `playwright-stealth` to avoid DataDome. If you get blocked,
-  wait 15+ minutes before retrying.
-- Never make non-stealth requests to `myaccount.nytimes.com` from the same IP.
+**Cookie expired**
+- You'll see "Cookie expired" in the error output (and a Telegram alert).
+- Log into nytimes.com in a browser and copy the `NYT-S` cookie value.
+- Update `.nyt_cookies.json` or tell the agent your new cookie.
 
 **PDF download failure**
 - Puzzle may not be published yet — it drops at 9 PM Central
@@ -245,11 +207,12 @@ The script fetches today's puzzle dynamically — no hardcoded date math:
    ```
    GET https://www.nytimes.com/svc/crosswords/v6/puzzle/daily.json
    ```
-2. Constructs the PDF URL using the puzzle ID and your configured block opacity:
+2. Downloads the PDF:
    ```
-   https://www.nytimes.com/svc/crosswords/v2/puzzle/{puzzle_id}.pdf?block_opacity=30
+   GET https://www.nytimes.com/svc/crosswords/v2/puzzle/{puzzle_id}.pdf
    ```
-3. Triggers the download via `window.location.href` (the PDF endpoint sends a
-   browser download event, not a normal page response).
+3. If `block_opacity` < 100, edits the PDF content stream to lighten the
+   black grid squares (the NYT API's `block_opacity` query parameter is
+   broken, so this is done client-side with PyMuPDF).
 
 These are undocumented NYT APIs — they could change at any time.
