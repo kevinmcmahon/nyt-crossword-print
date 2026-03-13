@@ -180,8 +180,50 @@ def download_crossword_pdf(config: dict, date: str | None = None) -> Path:
 # ---------------------------------------------------------------------------
 # Printing via CUPS
 # ---------------------------------------------------------------------------
-def print_pdf(pdf_path: Path, printer_name: str, copies: int = 1, fit_to_page: bool = True):
-    """Send a PDF to a CUPS printer using the `lp` command."""
+def wake_printer(printer_ip: str, port: int = 9100, timeout: int = 5, wait: int = 15) -> None:
+    """Poke the printer's raw port to wake it from sleep, then wait for it to come online."""
+    import socket
+    try:
+        with socket.create_connection((printer_ip, port), timeout=timeout):
+            pass
+        print(f"[info] Printer at {printer_ip}:{port} responded — waiting {wait}s for it to wake up...")
+        time.sleep(wait)
+    except OSError:
+        print(f"[warn] Could not reach printer at {printer_ip}:{port} for wake-up — proceeding anyway.")
+
+
+def print_pdf_raw(pdf_path: Path, printer_ip: str, port: int = 9100, timeout: int = 60) -> None:
+    """Convert PDF to PCL and send directly to printer via raw JetDirect (port 9100).
+    Bypasses CUPS/IPP entirely — more reliable over Tailscale routing."""
+    import socket
+    import tempfile
+
+    pcl_path = Path(tempfile.mktemp(suffix=".pcl"))
+    try:
+        print(f"[info] Converting PDF to PCL...")
+        result = subprocess.run(
+            ["gs", "-dNOPAUSE", "-dBATCH", "-sDEVICE=ljet4",
+             f"-sOutputFile={pcl_path}", str(pdf_path)],
+            capture_output=True, text=True
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"Ghostscript conversion failed: {result.stderr.strip()}")
+
+        pcl_data = pcl_path.read_bytes()
+        print(f"[info] Sending {len(pcl_data)} bytes to {printer_ip}:{port}...")
+
+        with socket.create_connection((printer_ip, port), timeout=timeout) as sock:
+            sock.sendall(pcl_data)
+
+        print(f"[info] Raw PCL sent successfully.")
+    finally:
+        if pcl_path.exists():
+            pcl_path.unlink()
+
+
+def print_pdf(pdf_path: Path, printer_name: str, copies: int = 1, fit_to_page: bool = True,
+              job_timeout: int = 120) -> None:
+    """Send a PDF to a CUPS printer and verify the job completes."""
 
     cmd = ["lp", "-d", printer_name, "-n", str(copies)]
     if fit_to_page:
@@ -194,7 +236,66 @@ def print_pdf(pdf_path: Path, printer_name: str, copies: int = 1, fit_to_page: b
     if result.returncode != 0:
         raise RuntimeError(f"Print failed: {result.stderr.strip()}")
 
-    print(f"[info] Print job submitted: {result.stdout.strip()}")
+    submitted = result.stdout.strip()
+    print(f"[info] Print job submitted: {submitted}")
+
+    # Extract job number and poll until complete or timeout
+    import re
+    match = re.search(rf"({re.escape(printer_name)}-\d+)", submitted)
+    if not match:
+        print("[warn] Could not parse job number — skipping completion check.")
+        return
+
+    job_id = match.group(1)
+    deadline = time.time() + job_timeout
+    poll_interval = 5
+
+    print(f"[info] Monitoring job {job_id} (timeout {job_timeout}s)...")
+    while time.time() < deadline:
+        time.sleep(poll_interval)
+
+        # Check if job shows as completed
+        check = subprocess.run(
+            ["lpstat", "-W", "completed", "-l"],
+            capture_output=True, text=True
+        )
+        if job_id in check.stdout:
+            print(f"[info] Job {job_id} completed.")
+            return
+
+        # Check active job status
+        active = subprocess.run(["lpstat", "-l"], capture_output=True, text=True)
+        if job_id in active.stdout:
+            if any(s in active.stdout for s in ["aborted", "canceled"]):
+                raise RuntimeError(
+                    f"Print job {job_id} failed in CUPS. "
+                    f"Printer may be offline or out of paper."
+                )
+            # Job still active (processing/processing-to-stop-point) — keep waiting
+            continue
+
+        # Job not in active or completed — check if printer is idle,
+        # which means it processed the job even if CUPS lost track of it.
+        printer_status = subprocess.run(
+            ["lpstat", "-p", printer_name], capture_output=True, text=True
+        )
+        if "idle" in printer_status.stdout.lower():
+            print(f"[info] Job {job_id} left queue and printer is idle — treating as success.")
+            return
+
+        print(f"[warn] Job {job_id} disappeared and printer is not idle — waiting...")
+
+    # Timeout — but if the printer is idle, the job likely completed fine
+    printer_status = subprocess.run(
+        ["lpstat", "-p", printer_name], capture_output=True, text=True
+    )
+    if "idle" in printer_status.stdout.lower():
+        print(f"[info] Monitoring timed out but printer is idle — treating as success.")
+        return
+
+    raise RuntimeError(
+        f"Print job {job_id} did not complete within {job_timeout}s — printer may be stuck."
+    )
 
 
 def check_printer_status(printer_name: str) -> str:
@@ -236,8 +337,13 @@ def main():
         sys.exit(0)
 
     printer_name = config.get("printer_name", "HP_LaserJet")
+    printer_ip = config.get("printer_ip")
     copies = config.get("copies", 1)
     fit_to_page = config.get("fit_to_page", True)
+
+    # Wake printer from sleep before checking status
+    if printer_ip:
+        wake_printer(printer_ip)
 
     # Check printer is reachable
     try:
@@ -266,7 +372,7 @@ def main():
                 print(f"[error] All {max_retries} download attempts failed.", file=sys.stderr)
                 sys.exit(1)
 
-    # Print
+    # Print via CUPS
     try:
         print_pdf(pdf_path, printer_name, copies, fit_to_page)
     except RuntimeError as e:

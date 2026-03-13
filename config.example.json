@@ -3,5 +3,6 @@
   "copies": 1,
   "fit_to_page": true,
   "block_opacity": 30,
-  "paused": false
+  "paused": false,
+  "printer_ip": ""
 }
