@@ -20,6 +20,16 @@ DOWNLOAD_DIR = SCRIPT_DIR / "downloads"
 COOKIE_PATH = SCRIPT_DIR / ".nyt_cookies.json"
 
 
+def _run_command(cmd: list[str], timeout: int) -> subprocess.CompletedProcess[str]:
+    """Run a command with a bounded timeout and convert hangs to useful errors."""
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            f"Command timed out after {timeout}s: {' '.join(cmd)}"
+        ) from exc
+
+
 def load_config() -> dict:
     with open(CONFIG_PATH) as f:
         return json.load(f)
@@ -108,19 +118,25 @@ def _make_browser_context(p):
     return browser, context
 
 
-def _download_pdf(context, pdf_url: str, pdf_path: Path) -> bool:
-    """Try to download the PDF. Returns True on success, False if auth expired."""
+def _download_pdf(context, pdf_url: str, pdf_path: Path) -> None:
+    """Download the PDF or raise a specific failure reason."""
     try:
         response = context.request.get(pdf_url, timeout=30000)  # 30s timeout
+        if response.status in (401, 403):
+            raise RuntimeError(
+                f"NYT auth failed while downloading PDF (HTTP {response.status}). "
+                "Please provide a fresh NYT-S cookie value."
+            )
         if response.status != 200:
-            return False
+            raise RuntimeError(f"Failed to download PDF (HTTP {response.status})")
         content_type = response.headers.get("content-type", "")
         if "pdf" not in content_type:
-            return False
+            raise RuntimeError(f"PDF download returned non-PDF content type: {content_type or 'unknown'}")
         pdf_path.write_bytes(response.body())
-        return True
-    except Exception:
-        return False
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        raise RuntimeError(f"PDF download failed: {exc}") from exc
 
 
 def _get_puzzle_id(page, date: str | None = None) -> tuple[int, str]:
@@ -131,11 +147,19 @@ def _get_puzzle_id(page, date: str | None = None) -> tuple[int, str]:
         url = f"https://www.nytimes.com/svc/crosswords/v6/puzzle/daily/{date}.json"
     else:
         url = "https://www.nytimes.com/svc/crosswords/v6/puzzle/daily.json"
-    resp = page.goto(url, wait_until="load", timeout=15000)
+    try:
+        resp = page.goto(url, wait_until="load", timeout=15000)
+    except Exception as exc:
+        raise RuntimeError(f"Failed to fetch puzzle info: {exc}") from exc
+    if resp is None:
+        raise RuntimeError("Failed to fetch puzzle info: no response from NYT")
     if resp.status != 200:
         raise RuntimeError(f"Failed to fetch puzzle info (HTTP {resp.status})")
-    data = resp.json()
-    return data["id"], data.get("publicationDate", "unknown")
+    try:
+        data = resp.json()
+        return data["id"], data.get("publicationDate", "unknown")
+    except Exception as exc:
+        raise RuntimeError(f"Failed to parse puzzle info response: {exc}") from exc
 
 
 def download_crossword_pdf(config: dict, date: str | None = None) -> Path:
@@ -151,28 +175,43 @@ def download_crossword_pdf(config: dict, date: str | None = None) -> Path:
     cookies = _load_cookies()
 
     with Stealth().use_sync(sync_playwright()) as p:
-        browser, context = _make_browser_context(p)
-        context.add_cookies(cookies)
-        page = context.new_page()
+        browser = None
+        context = None
+        try:
+            browser, context = _make_browser_context(p)
+            context.add_cookies(cookies)
+            page = context.new_page()
 
-        puzzle_id, pub_date = _get_puzzle_id(page, date)
-        pdf_url = f"https://www.nytimes.com/svc/crosswords/v2/puzzle/{puzzle_id}.pdf"
-        pdf_path = DOWNLOAD_DIR / f"crossword_{puzzle_id}.pdf"
-        print(f"[info] Puzzle #{puzzle_id} ({pub_date})")
+            puzzle_id, pub_date = _get_puzzle_id(page, date)
+            pdf_url = f"https://www.nytimes.com/svc/crosswords/v2/puzzle/{puzzle_id}.pdf"
+            pdf_path = DOWNLOAD_DIR / f"crossword_{puzzle_id}.pdf"
+            print(f"[info] Puzzle #{puzzle_id} ({pub_date})")
 
-        if not _download_pdf(context, pdf_url, pdf_path):
-            browser.close()
-            raise RuntimeError(
-                "Cookie expired — could not download the crossword PDF.\n"
-                "Please provide a fresh NYT-S cookie value."
-            )
+            _download_pdf(context, pdf_url, pdf_path)
 
-        print(f"[info] PDF saved to {pdf_path} ({pdf_path.stat().st_size} bytes)")
-        browser.close()
+            print(f"[info] PDF saved to {pdf_path} ({pdf_path.stat().st_size} bytes)")
+        except RuntimeError:
+            raise
+        except Exception as exc:
+            raise RuntimeError(f"Browser download failed: {exc}") from exc
+        finally:
+            if context is not None:
+                try:
+                    context.close()
+                except Exception:
+                    pass
+            if browser is not None:
+                try:
+                    browser.close()
+                except Exception:
+                    pass
 
     if block_opacity < 100:
         print(f"[info] Applying block opacity: {block_opacity}%")
-        _apply_block_opacity(pdf_path, block_opacity)
+        try:
+            _apply_block_opacity(pdf_path, block_opacity)
+        except Exception as exc:
+            raise RuntimeError(f"Failed to apply block opacity: {exc}") from exc
 
     return pdf_path
 
@@ -198,13 +237,15 @@ def print_pdf_raw(pdf_path: Path, printer_ip: str, port: int = 9100, timeout: in
     import socket
     import tempfile
 
-    pcl_path = Path(tempfile.mktemp(suffix=".pcl"))
+    temp_file = tempfile.NamedTemporaryFile(suffix=".pcl", delete=False)
+    temp_file.close()
+    pcl_path = Path(temp_file.name)
     try:
         print(f"[info] Converting PDF to PCL...")
-        result = subprocess.run(
+        result = _run_command(
             ["gs", "-dNOPAUSE", "-dBATCH", "-sDEVICE=ljet4",
              f"-sOutputFile={pcl_path}", str(pdf_path)],
-            capture_output=True, text=True, timeout=60
+            timeout=60,
         )
         if result.returncode != 0:
             raise RuntimeError(f"Ghostscript conversion failed: {result.stderr.strip()}")
@@ -231,7 +272,7 @@ def print_pdf(pdf_path: Path, printer_name: str, copies: int = 1, fit_to_page: b
     cmd.append(str(pdf_path))
 
     print(f"[info] Printing: {' '.join(cmd)}")
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    result = _run_command(cmd, timeout=30)
 
     if result.returncode != 0:
         raise RuntimeError(f"Print failed: {result.stderr.strip()}")
@@ -255,16 +296,16 @@ def print_pdf(pdf_path: Path, printer_name: str, copies: int = 1, fit_to_page: b
         time.sleep(poll_interval)
 
         # Check if job shows as completed
-        check = subprocess.run(
+        check = _run_command(
             ["lpstat", "-W", "completed", "-l"],
-            capture_output=True, text=True, timeout=15
+            timeout=15,
         )
         if job_id in check.stdout:
             print(f"[info] Job {job_id} completed.")
             return
 
         # Check active job status
-        active = subprocess.run(["lpstat", "-l"], capture_output=True, text=True, timeout=15)
+        active = _run_command(["lpstat", "-l"], timeout=15)
         if job_id in active.stdout:
             if any(s in active.stdout for s in ["aborted", "canceled"]):
                 raise RuntimeError(
@@ -276,9 +317,7 @@ def print_pdf(pdf_path: Path, printer_name: str, copies: int = 1, fit_to_page: b
 
         # Job not in active or completed — check if printer is idle,
         # which means it processed the job even if CUPS lost track of it.
-        printer_status = subprocess.run(
-            ["lpstat", "-p", printer_name], capture_output=True, text=True, timeout=15
-        )
+        printer_status = _run_command(["lpstat", "-p", printer_name], timeout=15)
         if "idle" in printer_status.stdout.lower():
             print(f"[info] Job {job_id} left queue and printer is idle — treating as success.")
             return
@@ -286,9 +325,7 @@ def print_pdf(pdf_path: Path, printer_name: str, copies: int = 1, fit_to_page: b
         print(f"[warn] Job {job_id} disappeared and printer is not idle — waiting...")
 
     # Timeout — but if the printer is idle, the job likely completed fine
-    printer_status = subprocess.run(
-        ["lpstat", "-p", printer_name], capture_output=True, text=True, timeout=15
-    )
+    printer_status = _run_command(["lpstat", "-p", printer_name], timeout=15)
     if "idle" in printer_status.stdout.lower():
         print(f"[info] Monitoring timed out but printer is idle — treating as success.")
         return
@@ -300,10 +337,8 @@ def print_pdf(pdf_path: Path, printer_name: str, copies: int = 1, fit_to_page: b
 
 def check_printer_status(printer_name: str) -> str:
     """Check CUPS printer status. Returns status string."""
-    result = subprocess.run(
+    result = _run_command(
         ["lpstat", "-p", printer_name],
-        capture_output=True,
-        text=True,
         timeout=15,
     )
     if result.returncode != 0:
@@ -367,7 +402,7 @@ def main():
             print(f"[info] Download attempt {attempt}/{max_retries}...")
             pdf_path = download_crossword_pdf(config, args.date)
             break
-        except RuntimeError as e:
+        except Exception as e:
             print(f"[warn] Attempt {attempt} failed: {e}", file=sys.stderr)
             if attempt < max_retries:
                 print(f"[info] Retrying in {retry_delay_seconds} seconds...")
@@ -379,7 +414,7 @@ def main():
     # Print via CUPS
     try:
         print_pdf(pdf_path, printer_name, copies, fit_to_page)
-    except RuntimeError as e:
+    except Exception as e:
         print(f"[error] {e}", file=sys.stderr)
         sys.exit(1)
 

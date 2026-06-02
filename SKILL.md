@@ -2,7 +2,7 @@
 name: nyt-crossword-print
 description: >
   Automatically downloads the daily NYT crossword puzzle PDF and prints it
-  to a network printer. Runs on a nightly schedule via cron. Supports
+  to a network printer. Runs on a nightly schedule via OpenClaw cron. Supports
   pause/resume via Telegram and sends error alerts on failure.
 version: 1.1.0
 author: user
@@ -86,17 +86,19 @@ Find your CUPS printer name with `lpstat -p -d`.
 | `block_opacity` | Black square darkness, 0 (white) to 100 (black)  |
 | `paused`        | `true` to skip nightly prints                    |
 
-## Cron Setup
+## OpenClaw Cron Setup
 
-Schedule the skill to run nightly at 9:05 PM Central:
+Schedule the skill to run nightly at 9:10 PM Central. The cron payload should
+run the script with `PYTHONUNBUFFERED=1` and a 300s shell timeout so logs survive
+slow or failed runs:
 
 ```bash
 openclaw cron add \
   --name "NYT Crossword Print" \
-  --cron "5 21 * * *" \
+  --cron "10 21 * * *" \
   --tz "America/Chicago" \
   --session isolated \
-  --message "Run the nyt-crossword-print skill: download and print today's crossword." \
+  --message "$(jq -r '.payload.message' cron-job.json)" \
   --deliver \
   --channel telegram
 ```
@@ -115,7 +117,7 @@ openclaw cron add \
 - **Status**: "crossword printing status"
   - Run: `python3 pause_resume.py status`
 
-All commands must be run from the skill directory: `cd /home/openclaw/projects/nyt-crossword-print && .venv/bin/python ...`
+All commands must be run from the project directory: `cd /home/mrrobot/projects/nyt-crossword-print && .venv/bin/python ...`
 
 ## How It Works
 
@@ -129,9 +131,9 @@ All commands must be run from the skill directory: `cd /home/openclaw/projects/n
 7. Sends the PDF to the configured CUPS printer via `lp`.
 8. Cleans up the downloaded PDF.
 
-If the cookie has expired, the script exits with an error. Because the cron
-job uses `--deliver --channel telegram`, you'll get a Telegram message telling
-you to provide a fresh cookie.
+If the cookie has expired, the script exits with an auth error. Because the
+OpenClaw cron job sends Telegram alerts on nonzero exits, you'll get a message
+telling you to provide a fresh cookie.
 
 ## Authentication
 
@@ -149,9 +151,11 @@ last several weeks before expiring. When it expires:
 
 ## Troubleshooting
 
-- **Cookie expired**: You'll see "Cookie expired" in the error output.
+- **Cookie expired**: You'll see an auth failure in the error output.
   Get a fresh `NYT-S` cookie from your browser and update `.nyt_cookies.json`.
 - **Printer offline**: Ensure the printer is reachable via Tailscale
   (`ping <printer-tailscale-ip>`) and registered in CUPS (`lpstat -p`).
 - **PDF not available**: The puzzle publishes at 9 PM CT. The script retries
-  up to 3 times with 60-second delays if the PDF is not yet available.
+  twice with a 10-second delay if the PDF is not yet available.
+- **Silent timeout / SIGTERM**: The OpenClaw cron command should be
+  `PYTHONUNBUFFERED=1 timeout 300 .venv/bin/python fetch_and_print.py 2>&1`.

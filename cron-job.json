@@ -2,13 +2,14 @@
   "name": "NYT Crossword Print",
   "schedule": {
     "kind": "cron",
-    "expr": "5 21 * * *",
+    "expr": "10 21 * * *",
     "tz": "America/Chicago"
   },
   "sessionTarget": "isolated",
   "payload": {
     "kind": "agentTurn",
-    "message": "Run the nyt-crossword-print skill: execute `python3 ~/.openclaw/skills/nyt-crossword-print/fetch_and_print.py` and report any errors to me. If it succeeds, no need to message me. If it fails, tell me what went wrong and suggest a fix.",
+    "message": "Run the NYT crossword print script.\n\n1. Check if paused:\n   cd /home/mrrobot/projects/nyt-crossword-print && .venv/bin/python pause_resume.py status\n   If output contains 'PAUSED', reply NO_REPLY and stop.\n\n2. Run the script with a hard 300s shell timeout:\n   cd /home/mrrobot/projects/nyt-crossword-print && PYTHONUNBUFFERED=1 timeout 300 .venv/bin/python fetch_and_print.py 2>&1\n   Use exec with timeout=330.\n\n3. Check the output:\n   - If output contains '[success]': reply NO_REPLY.\n   - If the command was killed by timeout (exit code 124) OR output contains '[error]' OR exit code != 0:\n     Send Kevin a Telegram message (to: 8578332427): \"⚠️ NYT Crossword Print failed — [brief reason from output, or 'script timed out after 300s']\"\n     Then reply NO_REPLY.\n\nDo NOT run any other commands.",
+    "timeoutSeconds": 420,
     "deliver": true,
     "channel": "telegram",
     "bestEffortDeliver": true
