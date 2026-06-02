@@ -111,7 +111,7 @@ def _make_browser_context(p):
 def _download_pdf(context, pdf_url: str, pdf_path: Path) -> bool:
     """Try to download the PDF. Returns True on success, False if auth expired."""
     try:
-        response = context.request.get(pdf_url)
+        response = context.request.get(pdf_url, timeout=30000)  # 30s timeout
         if response.status != 200:
             return False
         content_type = response.headers.get("content-type", "")
@@ -180,7 +180,7 @@ def download_crossword_pdf(config: dict, date: str | None = None) -> Path:
 # ---------------------------------------------------------------------------
 # Printing via CUPS
 # ---------------------------------------------------------------------------
-def wake_printer(printer_ip: str, port: int = 9100, timeout: int = 5, wait: int = 15) -> None:
+def wake_printer(printer_ip: str, port: int = 9100, timeout: int = 5, wait: int = 5) -> None:
     """Poke the printer's raw port to wake it from sleep, then wait for it to come online."""
     import socket
     try:
@@ -204,7 +204,7 @@ def print_pdf_raw(pdf_path: Path, printer_ip: str, port: int = 9100, timeout: in
         result = subprocess.run(
             ["gs", "-dNOPAUSE", "-dBATCH", "-sDEVICE=ljet4",
              f"-sOutputFile={pcl_path}", str(pdf_path)],
-            capture_output=True, text=True
+            capture_output=True, text=True, timeout=60
         )
         if result.returncode != 0:
             raise RuntimeError(f"Ghostscript conversion failed: {result.stderr.strip()}")
@@ -231,7 +231,7 @@ def print_pdf(pdf_path: Path, printer_name: str, copies: int = 1, fit_to_page: b
     cmd.append(str(pdf_path))
 
     print(f"[info] Printing: {' '.join(cmd)}")
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
 
     if result.returncode != 0:
         raise RuntimeError(f"Print failed: {result.stderr.strip()}")
@@ -257,14 +257,14 @@ def print_pdf(pdf_path: Path, printer_name: str, copies: int = 1, fit_to_page: b
         # Check if job shows as completed
         check = subprocess.run(
             ["lpstat", "-W", "completed", "-l"],
-            capture_output=True, text=True
+            capture_output=True, text=True, timeout=15
         )
         if job_id in check.stdout:
             print(f"[info] Job {job_id} completed.")
             return
 
         # Check active job status
-        active = subprocess.run(["lpstat", "-l"], capture_output=True, text=True)
+        active = subprocess.run(["lpstat", "-l"], capture_output=True, text=True, timeout=15)
         if job_id in active.stdout:
             if any(s in active.stdout for s in ["aborted", "canceled"]):
                 raise RuntimeError(
@@ -277,7 +277,7 @@ def print_pdf(pdf_path: Path, printer_name: str, copies: int = 1, fit_to_page: b
         # Job not in active or completed — check if printer is idle,
         # which means it processed the job even if CUPS lost track of it.
         printer_status = subprocess.run(
-            ["lpstat", "-p", printer_name], capture_output=True, text=True
+            ["lpstat", "-p", printer_name], capture_output=True, text=True, timeout=15
         )
         if "idle" in printer_status.stdout.lower():
             print(f"[info] Job {job_id} left queue and printer is idle — treating as success.")
@@ -287,7 +287,7 @@ def print_pdf(pdf_path: Path, printer_name: str, copies: int = 1, fit_to_page: b
 
     # Timeout — but if the printer is idle, the job likely completed fine
     printer_status = subprocess.run(
-        ["lpstat", "-p", printer_name], capture_output=True, text=True
+        ["lpstat", "-p", printer_name], capture_output=True, text=True, timeout=15
     )
     if "idle" in printer_status.stdout.lower():
         print(f"[info] Monitoring timed out but printer is idle — treating as success.")
@@ -304,6 +304,7 @@ def check_printer_status(printer_name: str) -> str:
         ["lpstat", "-p", printer_name],
         capture_output=True,
         text=True,
+        timeout=15,
     )
     if result.returncode != 0:
         raise RuntimeError(
@@ -317,12 +318,15 @@ def check_printer_status(printer_name: str) -> str:
 # ---------------------------------------------------------------------------
 def main():
     import argparse
+    # Unbuffered output so logs survive SIGTERM (exec captures line-by-line)
+    sys.stdout.reconfigure(line_buffering=True)
+    sys.stderr.reconfigure(line_buffering=True)
     parser = argparse.ArgumentParser(description="Download and print an NYT crossword.")
     parser.add_argument("--date", help="Puzzle date (YYYY-MM-DD). Defaults to today's puzzle.")
     args = parser.parse_args()
 
-    max_retries = 3
-    retry_delay_seconds = 60
+    max_retries = 2
+    retry_delay_seconds = 10
 
     # Load config
     try:
