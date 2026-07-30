@@ -65,35 +65,48 @@ def _load_cookies() -> list[dict]:
 def _apply_block_opacity(pdf_path: Path, opacity: int) -> None:
     """Lighten the black grid squares in a crossword PDF.
 
-    The NYT API ignores the block_opacity query parameter, so we
-    post-process the PDF ourselves by editing the content stream
-    directly.  Only the fill color preceding the square grid-cell
-    rectangles (21.77 x 21.77 pt) is changed — text and borders
-    stay black.
+    Uses PyMuPDF's drawing inspector to locate every black-filled shape and
+    paints an opaque gray rectangle on top of each one.  This works
+    regardless of whether the PDF uses RGB, grayscale, or CMYK fills, and
+    also handles PDFs that encode the black squares as semi-transparent fills
+    via ExtGState — Ghostscript's ljet4 PCL driver ignores PDF transparency
+    and would render those as solid black without this step.
 
     opacity: 0 (white) to 100 (solid black).
     """
     if opacity >= 100:
-        return  # nothing to do
-    import re as _re
+        return
 
     import fitz
 
-    gray_val = f"{1.0 - opacity / 100.0:.3f}"  # 30 → "0.700"
+    # opacity=30 → 30% black → RGB gray = 1 - 0.30 = 0.70 (light gray)
+    gray_val = 1.0 - opacity / 100.0
+    gray_color = (gray_val, gray_val, gray_val)
+
     doc = fitz.open(str(pdf_path))
+    modified = False
+
     for page in doc:
-        for xref in page.get_contents():
-            stream = doc.xref_stream(xref)
-            # Pattern: "0.000 g\n<coords> 21.77 -21.77 re B"
-            # Replace the fill color only for these grid-cell rectangles.
-            new_stream = _re.sub(
-                rb"0\.000 g\n([\d.]+ [\d.]+ 21\.77 -21\.77 re B)",
-                gray_val.encode() + b" g\n\\1",
-                stream,
-            )
-            if new_stream != stream:
-                doc.update_stream(xref, new_stream)
-    doc.saveIncr()
+        drawings = page.get_drawings()
+        black_fills = [
+            d for d in drawings
+            if d.get("fill") == (0.0, 0.0, 0.0) and d.get("rect") is not None
+        ]
+        if not black_fills:
+            continue
+
+        # Paint opaque gray rectangles over every black fill.  Drawing at the
+        # end of the content stream means these land on top, covering the
+        # original black (whether opaque or semi-transparent).
+        shape = page.new_shape()
+        for drawing in black_fills:
+            shape.draw_rect(drawing["rect"])
+        shape.finish(fill=gray_color, color=None, width=0)
+        shape.commit()
+        modified = True
+
+    if modified:
+        doc.saveIncr()
     doc.close()
 
 
@@ -183,7 +196,7 @@ def download_crossword_pdf(config: dict, date: str | None = None) -> Path:
             page = context.new_page()
 
             puzzle_id, pub_date = _get_puzzle_id(page, date)
-            pdf_url = f"https://www.nytimes.com/svc/crosswords/v2/puzzle/{puzzle_id}.pdf"
+            pdf_url = f"https://www.nytimes.com/svc/crosswords/v2/puzzle/{puzzle_id}.pdf?block_opacity={block_opacity}"
             pdf_path = DOWNLOAD_DIR / f"crossword_{puzzle_id}.pdf"
             print(f"[info] Puzzle #{puzzle_id} ({pub_date})")
 
@@ -219,21 +232,36 @@ def download_crossword_pdf(config: dict, date: str | None = None) -> Path:
 # ---------------------------------------------------------------------------
 # Printing via CUPS
 # ---------------------------------------------------------------------------
-def wake_printer(printer_ip: str, port: int = 9100, timeout: int = 5, wait: int = 5) -> None:
+def check_printer_reachable(printer_ip: str, port: int = 9100, timeout: int = 5) -> bool:
+    """Return True if the printer's JetDirect port is reachable."""
+    import socket
+    try:
+        with socket.create_connection((printer_ip, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def wake_printer(printer_ip: str, port: int = 9100, timeout: int = 5, wait: int = 15) -> None:
     """Poke the printer's raw port to wake it from sleep, then wait for it to come online."""
     import socket
     try:
         with socket.create_connection((printer_ip, port), timeout=timeout):
             pass
         print(f"[info] Printer at {printer_ip}:{port} responded — waiting {wait}s for it to wake up...")
-        time.sleep(wait)
     except OSError:
-        print(f"[warn] Could not reach printer at {printer_ip}:{port} for wake-up — proceeding anyway.")
+        print(f"[info] Printer at {printer_ip}:{port} is in deep sleep — waiting {wait}s for it to wake up...")
+    time.sleep(wait)  # Always wait, regardless of initial connection result
 
 
 def print_pdf_raw(pdf_path: Path, printer_ip: str, port: int = 9100, timeout: int = 60) -> None:
     """Convert PDF to PCL and send directly to printer via raw JetDirect (port 9100).
-    Bypasses CUPS/IPP entirely — more reliable over Tailscale routing."""
+    Bypasses CUPS/IPP entirely — more reliable over Tailscale routing.
+
+    _apply_block_opacity() replaces black fill values with actual gray fill values
+    before this function is called, so Ghostscript's ljet4 sees real gray and
+    renders correctly (it ignores PDF opacity/ExtGState entirely).
+    """
     import socket
     import tempfile
 
@@ -375,25 +403,44 @@ def main():
         print("[info] Crossword printing is PAUSED. Skipping.")
         sys.exit(0)
 
-    printer_name = config.get("printer_name", "HP_LaserJet")
     printer_ip = config.get("printer_ip")
     copies = config.get("copies", 1)
-    fit_to_page = config.get("fit_to_page", True)
+    print_max_retries = 3
+    print_retry_delay = 15
 
-    # Wake printer from sleep before checking status
-    if printer_ip:
-        wake_printer(printer_ip)
-
-    # Check printer is reachable
-    try:
-        status = check_printer_status(printer_name)
-        print(f"[info] Printer status: {status}")
-        if "disabled" in status.lower() or "not available" in status.lower():
-            print(f"[error] Printer '{printer_name}' appears unavailable: {status}", file=sys.stderr)
-            sys.exit(1)
-    except RuntimeError as e:
-        print(f"[error] {e}", file=sys.stderr)
+    if not printer_ip:
+        print("[error] Raw printing requires config.json printer_ip.", file=sys.stderr)
         sys.exit(1)
+
+    # Wake printer from sleep first, then verify it's actually reachable.
+    wake_printer(printer_ip)
+
+    # Pre-flight: verify printer is reachable before bothering to download.
+    # Retry a few times — printer may need extra time to wake from deep sleep.
+    print(f"[info] Checking printer reachability at {printer_ip}:9100...")
+    max_reach_attempts = 4
+    reach_wait = 15
+    reachable = False
+    for reach_attempt in range(1, max_reach_attempts + 1):
+        if check_printer_reachable(printer_ip):
+            reachable = True
+            break
+        if reach_attempt < max_reach_attempts:
+            print(f"[info] Printer not yet reachable (attempt {reach_attempt}/{max_reach_attempts}), waiting {reach_wait}s...")
+            time.sleep(reach_wait)
+    if not reachable:
+        print(f"[error] Printer at {printer_ip}:9100 not reachable after {max_reach_attempts} attempts — may be offline or subnet route down.", file=sys.stderr)
+        sys.exit(1)
+    print(f"[info] Printer reachable.")
+
+    # Clean up stale PDFs from previous failed runs.
+    try:
+        stale = [p for p in DOWNLOAD_DIR.glob("*.pdf") if p.stat().st_mtime < (time.time() - 86400)]
+        for p in stale:
+            p.unlink()
+            print(f"[info] Cleaned up stale PDF: {p.name}")
+    except OSError:
+        pass
 
     # Download with retries
     pdf_path = None
@@ -403,7 +450,12 @@ def main():
             pdf_path = download_crossword_pdf(config, args.date)
             break
         except Exception as e:
-            print(f"[warn] Attempt {attempt} failed: {e}", file=sys.stderr)
+            err = str(e)
+            print(f"[warn] Attempt {attempt} failed: {err}", file=sys.stderr)
+            # Don't retry permanent failures (auth, not-found, cookie errors)
+            if any(x in err for x in ["auth failed", "HTTP 401", "HTTP 403", "HTTP 404", "cookie"]):
+                print(f"[error] Permanent failure, not retrying: {err}", file=sys.stderr)
+                sys.exit(1)
             if attempt < max_retries:
                 print(f"[info] Retrying in {retry_delay_seconds} seconds...")
                 time.sleep(retry_delay_seconds)
@@ -411,12 +463,22 @@ def main():
                 print(f"[error] All {max_retries} download attempts failed.", file=sys.stderr)
                 sys.exit(1)
 
-    # Print via CUPS
-    try:
-        print_pdf(pdf_path, printer_name, copies, fit_to_page)
-    except Exception as e:
-        print(f"[error] {e}", file=sys.stderr)
-        sys.exit(1)
+    # Print directly to JetDirect; this avoids CUPS job-state polling over slow Tailscale paths.
+    for copy_number in range(1, copies + 1):
+        if copies > 1:
+            print(f"[info] Printing copy {copy_number}/{copies}...")
+        for attempt in range(1, print_max_retries + 1):
+            try:
+                print_pdf_raw(pdf_path, printer_ip)
+                break
+            except Exception as e:
+                print(f"[warn] Print attempt {attempt}/{print_max_retries} failed: {e}", file=sys.stderr)
+                if attempt < print_max_retries:
+                    print(f"[info] Retrying print in {print_retry_delay}s...")
+                    time.sleep(print_retry_delay)
+                else:
+                    print(f"[error] All {print_max_retries} print attempts failed.", file=sys.stderr)
+                    sys.exit(1)
 
     # Cleanup: remove the downloaded PDF after printing
     try:
